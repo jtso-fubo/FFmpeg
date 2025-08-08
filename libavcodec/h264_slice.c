@@ -48,6 +48,9 @@
 #include "libavutil/refstruct.h"
 #include "thread.h"
 #include "threadframe.h"
+#include "libavutil/timestamp.h"
+
+#include "uthash.h"
 
 static const uint8_t field_scan[16+1] = {
     0 + 0 * 4, 0 + 1 * 4, 1 + 0 * 4, 0 + 2 * 4,
@@ -2555,10 +2558,26 @@ static void er_add_slice(H264SliceContext *sl,
     }
 }
 
+typedef struct RefPts {
+    int64_t pts;          // The referenced PTS
+    UT_hash_handle hh;    // Makes this struct hashable
+} RefPts;
+
+static void add_reference_pts(RefPts **refs_set, int64_t ref_pts) {
+    RefPts *ref = NULL;
+    HASH_FIND(hh, *refs_set, &ref_pts, sizeof(int64_t), ref);
+    if (!ref) {
+        ref = av_mallocz(sizeof(RefPts));
+        ref->pts = ref_pts;
+        HASH_ADD(hh, *refs_set, pts, sizeof(int64_t), ref);
+    }
+}
+
 static int decode_slice(struct AVCodecContext *avctx, void *arg)
 {
     H264SliceContext *sl = arg;
     const H264Context *h = sl->h264;
+    RefPts *refs_set = NULL;
     int lf_x_start = sl->mb_x;
     int orig_deblock = sl->deblocking_filter;
     int ret;
@@ -2628,6 +2647,54 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
                     ff_h264_hl_decode_mb(h, sl);
                 sl->mb_y--;
             }
+
+            // printf("IN DECODE SLICE\n");
+            // printf("Ref count: %d\n", sl->ref_count[0]);
+            // printf("Pts: %lld\n", h->cur_pic_ptr->f->pts);
+
+            int8_t *ref_idx_l0 = h->cur_pic_ptr->ref_index[0];
+            int8_t *ref_idx_l1 = h->cur_pic_ptr->ref_index[1];
+            int xy = sl->mb_xy;
+            int b8_xy = 4 * xy;
+
+            // if (av_get_picture_type_char(h->cur_pic_ptr->f->pict_type) == 'I') {
+            //     printf("Keyframe: %d,Pts:%s, MB %d,  mb_type: %d, slice: %d\n",
+            //         !!(h->cur_pic_ptr->f->flags & AV_FRAME_FLAG_KEY), av_ts2str(h->cur_pic_ptr->f->pts), mb_index, h->cur_pic.mb_type[mb_xy], sl->slice_num);
+            // }
+            int mb_type = h->cur_pic.mb_type[xy];
+
+            if (mb_type && IS_INTER(mb_type)) {
+                if (USES_LIST(mb_type, 0) || USES_LIST(mb_type, 1)) {
+                    for (int dy = 0; dy < 2; dy++) {
+                        for (int dx = 0; dx < 2; dx++) {
+                            int idx = b8_xy + dy * 2 + dx;
+                            if (USES_LIST(mb_type, 0)) {
+                                if (ref_idx_l0[idx] >= 0) {
+                                    H264Ref *ref_L0 = &sl->ref_list[0][ref_idx_l0[idx]];
+                                    if (ref_L0 && ref_L0->parent && ref_L0->parent->f) {
+                                        AVFrame *f = ref_L0->parent->f;
+                                        // printf("MB %d, L0, Pts = %" PRId64 "\n", mb_index, f->pts);
+                                        add_reference_pts(&refs_set, f->pts);
+                                    }
+                                }
+                            }
+                            if (USES_LIST(mb_type, 1)) {
+                                if (ref_idx_l1[idx] >= 0) {
+                                    H264Ref *ref_L1 = &sl->ref_list[1][ref_idx_l1[idx]];
+                                    if (ref_L1 && ref_L1->parent && ref_L1->parent->f) {
+                                        AVFrame *f = ref_L1->parent->f;
+                                        // printf("MB %d, L1, Pts = %" PRId64 "\n", mb_index, f->pts);
+                                        add_reference_pts(&refs_set, f->pts);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                add_reference_pts(&refs_set, h->cur_pic_ptr->f->pts);
+            }
+            
             eos = get_cabac_terminate(&sl->cabac);
 
             if ((h->workaround_bugs & FF_BUG_TRUNCATED) &&
@@ -2699,6 +2766,53 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
                 sl->mb_y--;
             }
 
+            // printf("IN DECODE SLICE\n");
+            // printf("Ref count: %d\n", sl->ref_count[0]);
+            // printf("Pts: %lld\n", h->cur_pic_ptr->f->pts);
+
+            int8_t *ref_idx_l0 = h->cur_pic_ptr->ref_index[0];
+            int8_t *ref_idx_l1 = h->cur_pic_ptr->ref_index[1];
+            int xy = sl->mb_xy;
+            int b8_xy = 4 * xy;
+
+            // if (av_get_picture_type_char(h->cur_pic_ptr->f->pict_type) == 'I') {
+            //     printf("Keyframe: %d,Pts:%s, MB %d,  mb_type: %d, slice: %d\n",
+            //         !!(h->cur_pic_ptr->f->flags & AV_FRAME_FLAG_KEY), av_ts2str(h->cur_pic_ptr->f->pts), mb_index, h->cur_pic.mb_type[mb_xy], sl->slice_num);
+            // }
+            int mb_type = h->cur_pic.mb_type[xy];
+
+            if (mb_type && IS_INTER(mb_type)) {
+                if (USES_LIST(mb_type, 0) || USES_LIST(mb_type, 1)) {
+                    for (int dy = 0; dy < 2; dy++) {
+                        for (int dx = 0; dx < 2; dx++) {
+                            int idx = b8_xy + dy * 2 + dx;
+                            if (USES_LIST(mb_type, 0)) {
+                                if (ref_idx_l0[idx] >= 0) {
+                                    H264Ref *ref_L0 = &sl->ref_list[0][ref_idx_l0[idx]];
+                                    if (ref_L0 && ref_L0->parent && ref_L0->parent->f) {
+                                        AVFrame *f = ref_L0->parent->f;
+                                        // printf("MB %d, L0, Pts = %" PRId64 "\n", mb_index, f->pts);
+                                        add_reference_pts(&refs_set, f->pts);
+                                    }
+                                }
+                            }
+                            if (USES_LIST(mb_type, 1)) {
+                                if (ref_idx_l1[idx] >= 0) {
+                                    H264Ref *ref_L1 = &sl->ref_list[1][ref_idx_l1[idx]];
+                                    if (ref_L1 && ref_L1->parent && ref_L1->parent->f) {
+                                        AVFrame *f = ref_L1->parent->f;
+                                        // printf("MB %d, L1, Pts = %" PRId64 "\n", mb_index, f->pts);
+                                        add_reference_pts(&refs_set, f->pts);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                add_reference_pts(&refs_set, h->cur_pic_ptr->f->pts);
+            }
+
             if (ret < 0) {
                 av_log(h->avctx, AV_LOG_ERROR,
                        "error while decoding MB %d %d\n", sl->mb_x, sl->mb_y);
@@ -2759,6 +2873,25 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
 
 finish:
     sl->deblocking_filter = orig_deblock;
+    // Iterate over the set and print all reference PTS
+    RefPts *ref;
+    int first = 1;
+    printf("cur_frame_pts=%s|pict_type=%c|reference_pts=", av_ts2str(h->cur_pic_ptr->f->pts), av_get_picture_type_char(h->cur_pic_ptr->f->pict_type));
+    for (ref = refs_set; ref != NULL; ref = ref->hh.next) {
+        if (!first) {
+            printf(",");  // Print comma before the next PTS
+        }
+        printf("%s", av_ts2str(ref->pts));  // Print the reference PTS
+        first = 0;  // After the first iteration, set first to 0
+    }
+    printf("\n");
+
+    // Cleanup: Free memory
+    RefPts *tmp;
+    HASH_ITER(hh, refs_set, ref, tmp) {
+        HASH_DEL(refs_set, ref);  // Delete item from the hash table
+        free(ref);                 // Free the memory
+    }
     return 0;
 }
 
